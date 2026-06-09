@@ -1,0 +1,357 @@
+// StockWise — Prisma Schema
+// Run: npx prisma migrate dev --name init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────
+
+enum Plan {
+  FREE
+  STARTER
+  BUSINESS
+  ENTERPRISE
+}
+
+enum Role {
+  OWNER
+  MANAGER
+  STAFF
+}
+
+enum StockMovementType {
+  PURCHASE        // stock received from supplier
+  SALE            // stock reduced by a sale
+  ADJUSTMENT      // manual stock correction
+  TRANSFER_IN     // received from another location
+  TRANSFER_OUT    // sent to another location
+  RETURN          // customer return
+  DAMAGE          // damaged/written off
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  SENT
+  PARTIAL
+  RECEIVED
+  CANCELLED
+}
+
+enum SaleStatus {
+  PENDING
+  COMPLETED
+  REFUNDED
+}
+
+// ─────────────────────────────────────────────
+// ORGANISATION (tenant root)
+// ─────────────────────────────────────────────
+
+model Organisation {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  plan      Plan     @default(FREE)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users          User[]
+  products       Product[]
+  categories     Category[]
+  locations      Location[]
+  suppliers      Supplier[]
+  purchaseOrders PurchaseOrder[]
+  sales          Sale[]
+  invitations    Invitation[]
+  auditLogs      AuditLog[]
+
+  @@map("organisations")
+}
+
+// ─────────────────────────────────────────────
+// USER
+// ─────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(cuid())
+  orgId        String
+  email        String   @unique
+  passwordHash String
+  firstName    String
+  lastName     String
+  role         Role     @default(STAFF)
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  organisation Organisation    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  refreshTokens RefreshToken[]
+  stockMovements StockMovement[]
+  sales          Sale[]
+  auditLogs      AuditLog[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("refresh_tokens")
+}
+
+model Invitation {
+  id        String   @id @default(cuid())
+  orgId     String
+  email     String
+  role      Role     @default(STAFF)
+  token     String   @unique @default(cuid())
+  expiresAt DateTime
+  accepted  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@map("invitations")
+}
+
+// ─────────────────────────────────────────────
+// CATEGORY
+// ─────────────────────────────────────────────
+
+model Category {
+  id          String  @id @default(cuid())
+  orgId       String
+  name        String
+  description String?
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  products     Product[]
+
+  @@unique([orgId, name])
+  @@map("categories")
+}
+
+// ─────────────────────────────────────────────
+// LOCATION (warehouse / store)
+// ─────────────────────────────────────────────
+
+model Location {
+  id        String  @id @default(cuid())
+  orgId     String
+  name      String
+  address   String?
+  isDefault Boolean @default(false)
+
+  organisation    Organisation    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  inventoryItems  InventoryItem[]
+  stockMovements  StockMovement[]
+
+  @@map("locations")
+}
+
+// ─────────────────────────────────────────────
+// PRODUCT
+// ─────────────────────────────────────────────
+
+model Product {
+  id           String  @id @default(cuid())
+  orgId        String
+  categoryId   String?
+  sku          String
+  name         String
+  description  String?
+  barcode      String?
+  imageUrl     String?
+  costPrice    Decimal @default(0) @db.Decimal(12, 2)
+  sellingPrice Decimal @default(0) @db.Decimal(12, 2)
+  reorderPoint Int     @default(10)   // trigger low-stock alert below this
+  isActive     Boolean @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  organisation   Organisation    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  category       Category?       @relation(fields: [categoryId], references: [id])
+  inventoryItems InventoryItem[]
+  stockMovements StockMovement[]
+  purchaseItems  PurchaseItem[]
+  saleItems      SaleItem[]
+
+  @@unique([orgId, sku])
+  @@map("products")
+}
+
+// ─────────────────────────────────────────────
+// INVENTORY ITEM (current stock per location)
+// ─────────────────────────────────────────────
+
+model InventoryItem {
+  id           String    @id @default(cuid())
+  productId    String
+  locationId   String
+  quantity     Int       @default(0)
+  batchNumber  String?
+  mfgDate      DateTime?
+  expiryDate   DateTime?
+  updatedAt    DateTime  @updatedAt
+
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  location Location @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, locationId, batchNumber])
+  @@map("inventory_items")
+}
+
+// ─────────────────────────────────────────────
+// STOCK MOVEMENT (audit log for every change)
+// ─────────────────────────────────────────────
+
+model StockMovement {
+  id            String            @id @default(cuid())
+  productId     String
+  locationId    String
+  performedById String
+  type          StockMovementType
+  quantityDelta Int               // positive = stock in, negative = stock out
+  quantityBefore Int
+  quantityAfter  Int
+  referenceId   String?           // FK to sale / purchase order / transfer
+  notes         String?
+  createdAt     DateTime          @default(now())
+
+  product     Product  @relation(fields: [productId], references: [id])
+  location    Location @relation(fields: [locationId], references: [id])
+  performedBy User     @relation(fields: [performedById], references: [id])
+
+  @@map("stock_movements")
+}
+
+// ─────────────────────────────────────────────
+// SUPPLIER
+// ─────────────────────────────────────────────
+
+model Supplier {
+  id           String  @id @default(cuid())
+  orgId        String
+  name         String
+  contactName  String?
+  email        String?
+  phone        String?
+  address      String?
+  leadTimeDays Int?
+  notes        String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  organisation   Organisation    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  purchaseOrders PurchaseOrder[]
+
+  @@map("suppliers")
+}
+
+// ─────────────────────────────────────────────
+// PURCHASE ORDER
+// ─────────────────────────────────────────────
+
+model PurchaseOrder {
+  id           String              @id @default(cuid())
+  orgId        String
+  supplierId   String
+  status       PurchaseOrderStatus @default(DRAFT)
+  totalAmount  Decimal             @default(0) @db.Decimal(12, 2)
+  notes        String?
+  expectedDate DateTime?
+  receivedDate DateTime?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  organisation Organisation   @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  supplier     Supplier        @relation(fields: [supplierId], references: [id])
+  items        PurchaseItem[]
+
+  @@map("purchase_orders")
+}
+
+model PurchaseItem {
+  id              String  @id @default(cuid())
+  purchaseOrderId String
+  productId       String
+  quantityOrdered Int
+  quantityReceived Int    @default(0)
+  unitCost        Decimal @db.Decimal(12, 2)
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  product       Product       @relation(fields: [productId], references: [id])
+
+  @@map("purchase_items")
+}
+
+// ─────────────────────────────────────────────
+// SALE
+// ─────────────────────────────────────────────
+
+model Sale {
+  id          String     @id @default(cuid())
+  orgId       String
+  soldById    String
+  status      SaleStatus @default(COMPLETED)
+  totalAmount Decimal    @default(0) @db.Decimal(12, 2)
+  notes       String?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  soldBy       User          @relation(fields: [soldById], references: [id])
+  items        SaleItem[]
+
+  @@map("sales")
+}
+
+model SaleItem {
+  id         String  @id @default(cuid())
+  saleId     String
+  productId  String
+  quantity   Int
+  unitPrice  Decimal @db.Decimal(12, 2)
+  totalPrice Decimal @db.Decimal(12, 2)
+
+  sale    Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id])
+
+  @@map("sale_items")
+}
+
+// ─────────────────────────────────────────────
+// AUDIT LOG (all critical actions)
+// ─────────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  orgId      String
+  userId     String
+  action     String   // e.g. "product.created", "stock.adjusted"
+  entityType String   // e.g. "Product", "Sale"
+  entityId   String
+  oldValues  Json?
+  newValues  Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  organisation Organisation @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user         User          @relation(fields: [userId], references: [id])
+
+  @@map("audit_logs")
+}
